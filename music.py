@@ -3,7 +3,6 @@ from datetime import datetime, timedelta
 import irc.bot
 import os.path
 import requests
-import time
 import vlc
 import random
 import redis
