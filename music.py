@@ -7,10 +7,9 @@ import vlc
 import random
 import redis
 from threading import Timer, Thread
+import sys
 
-from settings import (HOST, PORT, USERNAME, CLIENT_ID, 
-    OAUTH_TOKEN, CHANNEL, ANDROID_DEVICE_ID, RADIO_STATIONS,
-    SUPERUSERS)
+from settings import TwitchConfig, GoogleConfig, MUSIC_VOTE_INTERVAL_MINUTES
 
 #JARED TO DO FOR 1/2/2018
 #TIDY UP THIS SCRIPT AND REQUIREMENTS FILES
@@ -38,6 +37,10 @@ class TimeUtils:
         dt2_ms = cls.datetime_to_ms(dt2)
         return abs(dt1_ms - dt2_ms)
 
+    @classmethod
+    def minutes_to_seconds(cls, m):
+        return m * 60
+
 class ElapsedTimer(Timer):
     def __init__(self, interval, function, *args, **kwargs):
         self.start_time = None
@@ -49,8 +52,6 @@ class ElapsedTimer(Timer):
 
     def elapsed(self):
         if self.start_time:
-            #return (self.start_time - ElapsedTimer.epoch).total_seconds() * 1000.0
-            #start_time_ms = TimeUtils.datetime_to_ms(self.start_time)
             return TimeUtils.ms_difference(self.start_time, datetime.now())
 
         return None
@@ -68,8 +69,12 @@ class Track:
         else:
             return 'No info'
 
+    def __repr__(self):
+        string = self.name + '\n' + self.track_id + '\n'
+        return string
+
 class RadioStation:
-    def __init__(self, name, playlist):
+    def __init__(self, name, playlist=None):
         self.name = name
         self.last_turned_to = TimeUtils.datetime_to_ms(datetime.now())
         self.current_song_index = 0 
@@ -147,10 +152,18 @@ class RadioStation:
         while len(track_list):
             index = random.randrange(0, len(track_list))
             new_tracks.append(track_list.pop(index))
-        return new_tracks        
+        return new_tracks
 
     def __str__(self):
         return self.name
+
+    def __repr__(self):
+        string = self.name + '\n'
+        string += str(self.current_song_index)
+        string += str(len(self.tracks)) + '\n'
+        for track in self.tracks:
+            string += repr(track)
+        return string
 
     def __eq__(self, other):
         if type(other) == str:
@@ -160,22 +173,28 @@ class RadioStation:
         return False
 
 class Radio:
-    def __init__(self, station_names, filepath=None):
-        #Google Auth
-        client = Mobileclient()
-        if filepath == None:
-            filepath = client.OAUTH_FILEPATH
-        if not os.path.isfile(filepath): 
-            client.perform_oauth(filepath) 
+    def __init__(self, radio_filepath=None):
+        self.android_device_id = GoogleConfig.ANDROID_DEVICE_ID
+        self.google_filepath = GoogleConfig.OAUTH_FILEPATH
+        self.station_names = GoogleConfig.RADIO_STATIONS
 
         self.db = redis.Redis()
+        self.radio_filepath = radio_filepath
+
+        #Google Auth
+        client = Mobileclient()
+
+        if self.google_filepath == None:
+            self.google_filepath = client.OAUTH_FILEPATH
+        if not os.path.isfile(self.google_filepath): 
+            client.perform_oauth(self.google_filepath) 
         
-        client.oauth_login(client.FROM_MAC_ADDRESS, oauth_credentials=filepath)
+        client.oauth_login(client.FROM_MAC_ADDRESS, oauth_credentials=self.google_filepath)
         self.client = client
 
         #Set up VLC 
         self.player = vlc.MediaPlayer()
-        self.stations = self.create_radio_stations(station_names)
+        self.stations = self.create_radio_stations(self.station_names)
 
         if self.stations:
             self.current_station = self.stations[0]
@@ -202,31 +221,29 @@ class Radio:
         track = self.current_station.prev_song()
         self.play_track(track)
 
-    def switch(self, name=None):
-        #log current time to the radio stations 'last tuned in' variable
-        #stop playing current song
-        #switch station to new station
-        #change current station variable
-        self.stop()
-
-        if not name: #go to next station
-            station_index = self.stations.index(self.current_station)
-            self.current_station = self.stations[(station_index + 1) % len(self.stations)]
-
-        elif name not in self.stations:
+    def switch(self, index=-1):
+        if not -1 <= index < len(self.stations): 
             return
-        
-        else:
-            station_index = self.stations.index(name)
-            self.current_station = self.stations[(station_index + 1) % len(self.stations)]
 
-        self.current_station.skip_ahead()
-        self.play()
-            
+        new_station = None
+
+        if index == -1: #go to next station
+            current_index = self.stations.index(self.current_station)
+            new_station = self.stations[(current_index + 1) % len(self.stations)]
+             
+        else: #go to specific station
+            new_station = self.stations[index]
+
+        if self.current_station != new_station:
+            self.stop()
+            self.current_station = new_station
+            self.current_station.skip_ahead()
+            self.play()
+
     def play_track(self, track, ms=0):
         self.stop()
 
-        url = self.client.get_stream_url(track.track_id, device_id=ANDROID_DEVICE_ID)
+        url = self.client.get_stream_url(track.track_id, device_id=self.android_device_id)
         s = str(int(TimeUtils.ms_to_sec(ms)))
         self.player.set_mrl(url, 'start-time=' + s)
         print('Playing... ' + str(track))
@@ -266,27 +283,87 @@ class Radio:
                 break
         
         return station
-   
+    
+    def __repr__(self):
+        string = str(self.current_station) + '\n'
+        string += str(len(self.station_names)) + '\n'
+        for station in self.stations:
+            string += repr(station)
+
+class Poll:
+    def __init__(self, options : list, minutes=15, callback=lambda: None):
+        self.option_names = options
+        self.votes = [0] * len(options)
+        self.voters = set()
+        self.duration = TimeUtils.minutes_to_seconds(minutes)
+        self.open = False
+        self.timer = None
+        self.callback = callback
+
+    def start(self):
+        self.open = True
+        self.timer = ElapsedTimer(self.duration, self.callback) 
+        self.timer.start()
+
+    def end(self):
+        self.open = False
+        self.timer.cancel() 
+
+    def add_vote(self, voter, index):
+        if self.open and voter not in self.voters:
+            try:
+                index = int(index)
+                if 0 <= index < len(self.option_names):
+                    self.voters.add(voter)
+                    self.votes[index] += 1
+            except ValueError:
+                pass
+
+    def leader(self) -> int:
+        maxVotes = max(self.votes)
+        maxIndex = self.votes.index(maxVotes)
+        return maxIndex
+
+    def restart(self):
+        self.end()
+        self.clear()
+        self.start()
+
+    def clear(self):
+        self.voters.clear()
+        self.votes = [0] * len(self.option_names)
+
+    def __str__(self):
+        string = ''
+        for i, option in enumerate(self.option_names):
+            string += option + ': ' + str(self.votes[i]) + ', '
+        return string.rstrip(', ')
+
 class MusicBot(irc.bot.SingleServerIRCBot):
 
-    def __init__(self, username, client_id, oauth_token, channel, superusers, station_names=None, filepath=None):
-        print(TimeUtils.datetime_to_ms(TimeUtils.epoch))
+    def __init__(self):
         #Twitch Auth
-        self.username = username
-        self.client_id = client_id
-        self.oauth_token = oauth_token
-        self.channel = '#' + channel
+        self.username = TwitchConfig.USERNAME
+        self.client_id = TwitchConfig.CLIENT_ID
+        self.oauth_token = TwitchConfig.OAUTH_TOKEN
+        self.channel = '#' + TwitchConfig.CHANNEL
+        self.superusers = TwitchConfig.SUPERUSERS
+        self.host = TwitchConfig.HOST
+        self.port = TwitchConfig.PORT
 
-        self.channel_url = 'https://api.twitch.tv/kraken/users?login=' + channel
-        headers = {'Client-ID': client_id, 'Accept': 'application/vnd.twitchtv.v5+json'}
+        self.channel_url = 'https://api.twitch.tv/kraken/users?login=' + self.channel[1:]
+        headers = {'Client-ID': self.client_id, 'Accept': 'application/vnd.twitchtv.v5+json'}
         r = requests.get(self.channel_url, headers=headers).json()
         self.channel_id = r['users'][0]['_id']
 
-        self.radio = Radio(station_names, filepath)
-        self.superusers = superusers
+        print('Connecting to Google Auth...')
+        self.radio = Radio()
+        self.music_poll = Poll(self.radio.station_names, minutes=MUSIC_VOTE_INTERVAL_MINUTES, callback=self._music_poll_callback)
+        self.last_help_command_time = datetime.now()
 
-        print('Connecting to ' + HOST + ' on port ' + str(PORT))
-        irc.bot.SingleServerIRCBot.__init__(self, [(HOST, PORT, oauth_token)], username, username)
+        print('Connecting to ' + str(self.host) + ' on port ' + str(self.port) + '...')
+        irc.bot.SingleServerIRCBot.__init__(self, [(self.host, self.port, self.oauth_token)], 
+                                                self.username, self.username)
 
     def on_welcome(self, c, e):
         #Request capabilities
@@ -296,32 +373,100 @@ class MusicBot(irc.bot.SingleServerIRCBot):
         c.join(self.channel)
         print('Joined ' + self.channel)
         self.radio.play()
+        self.music_poll.start()
 
-    adminCommands = ['play', 'stop', 'next', 'prev', 'switch']
-    commands = ['song']
+    commands = ['vote']
+    admin_commands = ['play', 'stop', 'next', 'prev', 'switch', 'votes', 'quit']
+    help_commands = ['vote_time', 'song', 'stations']
 
     def on_pubmsg(self, c, e):
-        if e.arguments[0][0] != '!':
+        if not e.arguments[0].startswith('!'):
             return
-
+        
         args = e.arguments[0][1:].split(' ')
-        if len(args) and args[0] in MusicBot.adminCommands:
-            if c.real_nickname.lower() in self.superusers:
-                self.do_admin_command(args)
-
-
-    def do_admin_command(self, args):
         command = args[0]
+
+        if command in MusicBot.commands:
+            self.do_command(c, command, args)
+
+        elif command in MusicBot.help_commands:
+            self.do_help_command(c, command, args)
+
+        elif command in MusicBot.admin_commands:
+            if c.real_nickname.lower() in self.superusers:
+                self.do_admin_command(command, args)
+
+    def on_privmsg(self, c, e):
+        if c.real_nickname.lower() in self.superusers:
+            self.on_pubmsg(c, e)
+
+    def do_command(self, c, cmd, args):
+        if len(args) == 2:
+            if cmd == 'vote':
+                self.music_poll.add_vote(c.real_nickname, args[1])
+
+    def do_help_command(self, c, cmd, args):
         if len(args) == 1:
-            exec('self.radio.' + command + '()')
+            now = datetime.now()
+            if (now - self.last_help_command_time).total_seconds() > 10:
+                self.last_help_command_time = now
+                if cmd == 'vote_time':
+                    self.vote_time()
+                elif cmd == 'song':
+                    self.song()
+                elif cmd == 'stations':
+                    self.stations()
+
+    def do_admin_command(self, cmd, args):
+        if len(args) == 1:
+            if cmd == 'play':
+                self.radio.play()
+            elif cmd == 'stop':
+                self.radio.stop()
+            elif cmd == 'next':
+                self.radio.next()
+            elif cmd == 'prev':
+                self.radio.prev()
+            elif cmd == 'switch':
+                self.radio.switch()
+            elif cmd == 'votes':
+                self.votes()
+            elif cmd == 'quit':
+                self.quit()
 
         elif len(args) == 2:
-            if command == 'switch':
-                station = args[1]
-                if station in self.radio.stations:
-                    self.radio.switch(station)
+            if cmd == 'switch':
+                index = args[1]
+                if str.isdigit(index):
+                    self.radio.switch(int(index))
 
+    def _music_poll_callback(self): 
+        self.radio.switch(self.music_poll.leader())
+        self.music_poll.restart()
+
+    def vote_time(self):
+        c = self.connection
+        time_left = self.music_poll.duration - TimeUtils.ms_to_sec(self.music_poll.timer.elapsed())
+        c.privmsg(self.channel, str(time_left) + ' ms left')
+
+    def stations(self):
+        c = self.connection
+        c.privmsg(self.channel, ', '.join([str(i) + ': ' + str(station) for i, station in enumerate(self.radio.stations)]))
+
+    def song(self):
+        c = self.connection
+        song_name = str(self.radio.current_station.current_song())
+        c.privmsg(self.channel, song_name)
+
+    def votes(self):
+        c = self.connection
+        c.privmsg(self.channel, str(self.music_poll))
+    
+    def quit(self):
+        self.radio.stop()
+        self.music_poll.end()
+        sys.exit(0)
 
 if __name__ == '__main__':
-    bot = MusicBot(USERNAME, CLIENT_ID, OAUTH_TOKEN, CHANNEL, SUPERUSERS, RADIO_STATIONS)
+    bot = MusicBot()
     bot.start()
