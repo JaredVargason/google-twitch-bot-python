@@ -1,6 +1,7 @@
 from gmusicapi import Mobileclient, Musicmanager
 from datetime import datetime, timedelta
 import irc.bot
+from irc.client import NickMask
 import os.path
 import requests
 import vlc
@@ -380,32 +381,29 @@ class MusicBot(irc.bot.SingleServerIRCBot):
     help_commands = ['vote_time', 'song', 'stations']
 
     def on_pubmsg(self, c, e):
-        if not e.arguments[0].startswith('!'):
+        if not e.arguments[0].startswith('-'):
             return
         
         args = e.arguments[0][1:].split(' ')
         command = args[0]
+        user = self._get_user(e)
 
         if command in MusicBot.commands:
-            self.do_command(c, command, args)
+            self.do_command(user, command, args)
 
         elif command in MusicBot.help_commands:
-            self.do_help_command(c, command, args)
+            self.do_help_command(command, args)
 
         elif command in MusicBot.admin_commands:
-            if c.real_nickname.lower() in self.superusers:
+            if user in self.superusers:
                 self.do_admin_command(command, args)
 
-    def on_privmsg(self, c, e):
-        if c.real_nickname.lower() in self.superusers:
-            self.on_pubmsg(c, e)
-
-    def do_command(self, c, cmd, args):
+    def do_command(self, user, cmd, args):
         if len(args) == 2:
             if cmd == 'vote':
-                self.music_poll.add_vote(c.real_nickname, args[1])
+                self.music_poll.add_vote(user, args[1])
 
-    def do_help_command(self, c, cmd, args):
+    def do_help_command(self, cmd, args):
         if len(args) == 1:
             now = datetime.now()
             if (now - self.last_help_command_time).total_seconds() > 10:
@@ -440,6 +438,9 @@ class MusicBot(irc.bot.SingleServerIRCBot):
                 if str.isdigit(index):
                     self.radio.switch(int(index))
 
+    def _get_user(self, e):
+        return NickMask(e.source).user
+
     def _music_poll_callback(self): 
         self.radio.switch(self.music_poll.leader())
         self.music_poll.restart()
@@ -447,7 +448,7 @@ class MusicBot(irc.bot.SingleServerIRCBot):
     def vote_time(self):
         c = self.connection
         time_left = self.music_poll.duration - TimeUtils.ms_to_sec(self.music_poll.timer.elapsed())
-        c.privmsg(self.channel, str(time_left) + ' ms left')
+        c.privmsg(self.channel, str(time_left) + ' seconds left')
 
     def stations(self):
         c = self.connection
