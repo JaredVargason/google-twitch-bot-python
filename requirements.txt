@@ -33,7 +33,7 @@ python-dateutil==2.7.5
 python-vlc==3.0.4106
 pytz==2018.7
 requests==2.21.0
-rsa==4.0
+rsa==4.1
 six==1.12.0
 soupsieve==1.6.1
 tempora==1.14
