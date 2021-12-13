@@ -17,7 +17,7 @@ jaraco.itertools==4.0.0
 jaraco.logging==2.0
 jaraco.stream==2.0
 jaraco.text==2.0
-lxml==4.2.5
+lxml==4.6.5
 MechanicalSoup==0.11.0
 mock==2.0.0
 more-itertools==5.0.0
